@@ -44,6 +44,9 @@ type Options struct {
 	// An origin may contain a wildcard (*) to replace 0 or more characters
 	// (i.e.: http://*.domain.com). Usage of wildcards implies a small performance penalty.
 	// Only one wildcard can be used per origin.
+	// When AllowCredentials is true and "*" is present, the normalized request
+	// origin is reflected in responses instead of the wildcard, as required by
+	// the Fetch standard.
 	// Default value is ["*"]
 	AllowedOrigins []string
 	// AllowOriginFunc is a custom function to validate the origin. It take the
@@ -84,6 +87,10 @@ type Options struct {
 	MaxAge int
 	// AllowCredentials indicates whether the request can include user credentials like
 	// cookies, HTTP authentication or client side SSL certificates.
+	// Because the Fetch standard forbids combining the "*" wildcard with
+	// credentialed requests, enabling this option turns the
+	// Access-Control-Allow-Origin response header into a reflection of the
+	// (normalized) request origin whenever AllowedOrigins contains "*".
 	AllowCredentials bool
 	// AllowPrivateNetwork indicates whether to accept cross-origin requests over a
 	// private network.
@@ -328,7 +335,7 @@ func (c *Cors) ServeHTTP(w http.ResponseWriter, r *http.Request, next http.Handl
 // handlePreflight handles pre-flight CORS requests
 func (c *Cors) handlePreflight(w http.ResponseWriter, r *http.Request) {
 	headers := w.Header()
-	origin := r.Header.Get("Origin")
+	origin, originOK := originFromRequest(r)
 
 	// Always set Vary headers
 	// see https://github.com/rs/cors/issues/10,
@@ -337,6 +344,10 @@ func (c *Cors) handlePreflight(w http.ResponseWriter, r *http.Request) {
 		headers["Vary"] = append(vary, c.preflightVary[0])
 	} else {
 		headers["Vary"] = c.preflightVary
+	}
+	if !originOK {
+		c.logf("  Preflight aborted: invalid origin")
+		return
 	}
 	allowed, additionalVaryHeaders := c.isOriginAllowed(r, origin)
 	if len(additionalVaryHeaders) > 0 {
@@ -368,9 +379,15 @@ func (c *Cors) handlePreflight(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if c.allowedOriginsAll {
-		headers["Access-Control-Allow-Origin"] = headerOriginAll
+		if c.allowCredentials {
+			// The Fetch standard forbids combining the "*" wildcard with
+			// credentialed requests; reflect the normalized origin instead.
+			headers["Access-Control-Allow-Origin"] = []string{origin}
+		} else {
+			headers["Access-Control-Allow-Origin"] = headerOriginAll
+		}
 	} else {
-		headers["Access-Control-Allow-Origin"] = r.Header["Origin"]
+		headers["Access-Control-Allow-Origin"] = []string{origin}
 	}
 	// Spec says: Since the list of methods can be unbounded, simply returning the method indicated
 	// by Access-Control-Request-Method (if supported) can be enough
@@ -398,9 +415,7 @@ func (c *Cors) handlePreflight(w http.ResponseWriter, r *http.Request) {
 // handleActualRequest handles simple cross-origin requests, actual request or redirects
 func (c *Cors) handleActualRequest(w http.ResponseWriter, r *http.Request) {
 	headers := w.Header()
-	origin := r.Header.Get("Origin")
-
-	allowed, additionalVaryHeaders := c.isOriginAllowed(r, origin)
+	origin, originOK := originFromRequest(r)
 
 	// Always set Vary, see https://github.com/rs/cors/issues/10
 	if vary := headers["Vary"]; vary == nil {
@@ -408,6 +423,12 @@ func (c *Cors) handleActualRequest(w http.ResponseWriter, r *http.Request) {
 	} else {
 		headers["Vary"] = append(vary, headerVaryOrigin[0])
 	}
+	if !originOK {
+		c.logf("  Actual request no headers added: invalid origin")
+		return
+	}
+	allowed, additionalVaryHeaders := c.isOriginAllowed(r, origin)
+
 	if len(additionalVaryHeaders) > 0 {
 		headers.Add("Vary", strings.Join(convert(additionalVaryHeaders, http.CanonicalHeaderKey), ", "))
 	}
@@ -429,9 +450,15 @@ func (c *Cors) handleActualRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if c.allowedOriginsAll {
-		headers["Access-Control-Allow-Origin"] = headerOriginAll
+		if c.allowCredentials {
+			// The Fetch standard forbids combining the "*" wildcard with
+			// credentialed requests; reflect the normalized origin instead.
+			headers["Access-Control-Allow-Origin"] = []string{origin}
+		} else {
+			headers["Access-Control-Allow-Origin"] = headerOriginAll
+		}
 	} else {
-		headers["Access-Control-Allow-Origin"] = r.Header["Origin"]
+		headers["Access-Control-Allow-Origin"] = []string{origin}
 	}
 	if len(c.exposedHeaders) > 0 {
 		headers["Access-Control-Expose-Headers"] = c.exposedHeaders
@@ -456,7 +483,10 @@ func (c *Cors) logf(format string, a ...any) {
 // WebSocket's CheckOrigin; the middleware itself still lets an
 // origin-less request through.
 func (c *Cors) OriginAllowed(r *http.Request) bool {
-	origin := r.Header.Get("Origin")
+	origin, ok := originFromRequest(r)
+	if !ok {
+		return false
+	}
 	allowed, _ := c.isOriginAllowed(r, origin)
 	return allowed
 }

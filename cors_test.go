@@ -128,10 +128,116 @@ func TestSpec(t *testing.T) {
 			},
 			http.Header{
 				"Vary":                             {"Origin"},
-				"Access-Control-Allow-Origin":      {"*"},
+				"Access-Control-Allow-Origin":      {"http://foobar.com"},
 				"Access-Control-Allow-Credentials": {"true"},
 			},
 			true,
+		},
+		{
+			"MatchAllOriginWithCredentialsPreflight",
+			Options{
+				AllowedOrigins:   []string{"*"},
+				AllowCredentials: true,
+			},
+			"OPTIONS",
+			http.Header{
+				"Origin":                        {"http://foobar.com"},
+				"Access-Control-Request-Method": {"GET"},
+			},
+			http.Header{
+				"Vary":                             {"Origin, Access-Control-Request-Method, Access-Control-Request-Headers"},
+				"Access-Control-Allow-Origin":      {"http://foobar.com"},
+				"Access-Control-Allow-Methods":     {"GET"},
+				"Access-Control-Allow-Credentials": {"true"},
+			},
+			true,
+		},
+		{
+			"UppercaseOriginNormalized",
+			Options{
+				AllowedOrigins: []string{"http://foobar.com"},
+			},
+			"GET",
+			http.Header{
+				"Origin": {"HTTP://FOOBAR.COM"},
+			},
+			http.Header{
+				"Vary":                        {"Origin"},
+				"Access-Control-Allow-Origin": {"http://foobar.com"},
+			},
+			true,
+		},
+		{
+			"MalformedOrigin",
+			Options{
+				AllowedOrigins: []string{"*"},
+			},
+			"GET",
+			http.Header{
+				"Origin": {"http://foo bar.com"},
+			},
+			http.Header{
+				"Vary": {"Origin"},
+			},
+			false,
+		},
+		{
+			"OriginMissingScheme",
+			Options{
+				AllowedOrigins: []string{"*"},
+			},
+			"GET",
+			http.Header{
+				"Origin": {"foobar.com"},
+			},
+			http.Header{
+				"Vary": {"Origin"},
+			},
+			false,
+		},
+		{
+			"MalformedOriginPreflight",
+			Options{
+				AllowedOrigins: []string{"*"},
+			},
+			"OPTIONS",
+			http.Header{
+				"Origin":                        {"foobar.com"},
+				"Access-Control-Request-Method": {"GET"},
+			},
+			http.Header{
+				"Vary": {"Origin, Access-Control-Request-Method, Access-Control-Request-Headers"},
+			},
+			false,
+		},
+		{
+			"DuplicateOriginHeaders",
+			Options{
+				AllowedOrigins: []string{"http://foobar.com"},
+			},
+			"GET",
+			http.Header{
+				"Origin": {"http://foobar.com", "http://foobar.com"},
+			},
+			http.Header{
+				"Vary": {"Origin"},
+			},
+			false,
+		},
+		{
+			"DuplicateOriginHeadersPreflight",
+			Options{
+				AllowedOrigins: []string{"*"},
+			},
+			"OPTIONS",
+			http.Header{
+				"Origin":                        {"http://foobar.com", "http://foobar.com"},
+				"Access-Control-Request-Method": {"GET"},
+			},
+			http.Header{
+				"Vary": {"Origin, Access-Control-Request-Method, Access-Control-Request-Headers"},
+			},
+			false,
 		},
 		{
 			"AllowedOrigin",
