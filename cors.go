@@ -66,15 +66,25 @@ type Options struct {
 	// `AllowOriginRequestFunc` are ignored.
 	AllowOriginVaryRequestFunc func(r *http.Request, origin string) (bool, []string)
 	// AllowedMethods is a list of methods the client is allowed to use with
-	// cross-domain requests. Default value is simple methods (HEAD, GET and POST).
+	// cross-domain requests. Method names are normalized to upper case and
+	// de-duplicated at construction time (per the method-normalization rules
+	// of the Fetch standard), so "get" is treated as "GET". If the special "*"
+	// value is present in the list, every method is allowed and the wildcard
+	// takes precedence over the rest of the list.
+	// Default value is simple methods (HEAD, GET and POST).
 	AllowedMethods []string
 	// AllowedHeaders is list of non simple headers the client is allowed to use with
 	// cross-domain requests.
-	// If the special "*" value is present in the list, all headers will be allowed.
+	// Header names are matched case-insensitively and de-duplicated at
+	// construction time. If the special "*" value is present in the list, all
+	// headers will be allowed and the wildcard takes precedence over the rest
+	// of the list.
 	// Default value is [].
 	AllowedHeaders []string
 	// ExposedHeaders indicates which headers are safe to expose to the API of a CORS
-	// API specification
+	// API specification. Header names are canonicalized and de-duplicated at
+	// construction time, so the same header configured under different cases
+	// is emitted only once.
 	ExposedHeaders []string
 	// MaxAge indicates how long (in seconds) the results of a preflight request
 	// can be cached. Default value is 0, which stands for no
@@ -123,6 +133,8 @@ type Cors struct {
 	allowedHeaders internal.SortedSet
 	// Normalized list of allowed methods
 	allowedMethods []string
+	// Set to true when allowed methods contains a "*"
+	allowedMethodsAll bool
 	// Pre-computed normalized list of exposed headers
 	exposedHeaders []string
 	// Pre-computed maxAge header value
@@ -199,11 +211,15 @@ func New(options Options) *Cors {
 		// Use sensible defaults
 		c.allowedHeaders = internal.NewSortedSet("accept", "content-type", "x-requested-with")
 	} else {
-		normalized := convert(options.AllowedHeaders, strings.ToLower)
-		c.allowedHeaders = internal.NewSortedSet(normalized...)
-		if slices.Contains(options.AllowedHeaders, "*") {
+		normalized := normalizeHeaderNames(options.AllowedHeaders)
+		if len(normalized) == 1 && normalized[0] == "*" {
+			// The wildcard takes precedence over any other configured header.
 			c.allowedHeadersAll = true
 			c.allowedHeaders = internal.SortedSet{}
+		} else {
+			// NewSortedSet stores lower-cased names; the Fetch standard
+			// guarantees that request-header names are lowercase.
+			c.allowedHeaders = internal.NewSortedSet(convert(normalized, strings.ToLower)...)
 		}
 	}
 
@@ -212,7 +228,10 @@ func New(options Options) *Cors {
 		// Default is spec's "simple" methods
 		c.allowedMethods = []string{http.MethodGet, http.MethodPost, http.MethodHead}
 	} else {
-		c.allowedMethods = options.AllowedMethods
+		c.allowedMethods = normalizeMethods(options.AllowedMethods)
+		if len(c.allowedMethods) == 1 && c.allowedMethods[0] == "*" {
+			c.allowedMethodsAll = true
+		}
 	}
 
 	// Options Success Status Code
@@ -224,7 +243,8 @@ func New(options Options) *Cors {
 
 	// Pre-compute exposed headers header value
 	if len(options.ExposedHeaders) > 0 {
-		c.exposedHeaders = []string{strings.Join(convert(options.ExposedHeaders, http.CanonicalHeaderKey), ", ")}
+		normalized := normalizeHeaderNames(options.ExposedHeaders)
+		c.exposedHeaders = []string{strings.Join(normalized, ", ")}
 	}
 
 	// Pre-compute prefight Vary header to save allocations
@@ -352,7 +372,7 @@ func (c *Cors) handlePreflight(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reqMethod := r.Header.Get("Access-Control-Request-Method")
+	reqMethod := strings.ToUpper(r.Header.Get("Access-Control-Request-Method"))
 	if !c.isMethodAllowed(reqMethod) {
 		c.logf("  Preflight aborted: method '%s' not allowed", reqMethod)
 		return
@@ -363,6 +383,7 @@ func (c *Cors) handlePreflight(w http.ResponseWriter, r *http.Request) {
 	// However, some gateways split that header into multiple headers of the same name;
 	// see https://github.com/rs/cors/issues/184.
 	reqHeaders, found := r.Header["Access-Control-Request-Headers"]
+	reqHeaderNames := normalizeRequestHeaderValues(reqHeaders)
 	if found && !c.allowedHeadersAll && !c.allowedHeaders.Accepts(reqHeaders) {
 		c.logf("  Preflight aborted: headers '%v' not allowed", reqHeaders)
 		return
@@ -374,14 +395,13 @@ func (c *Cors) handlePreflight(w http.ResponseWriter, r *http.Request) {
 	}
 	// Spec says: Since the list of methods can be unbounded, simply returning the method indicated
 	// by Access-Control-Request-Method (if supported) can be enough
-	headers["Access-Control-Allow-Methods"] = r.Header["Access-Control-Request-Method"]
-	for _, reqHeader := range reqHeaders {
-		if reqHeader != "" {
-			// Spec says: Since the list of headers can be unbounded, simply returning supported headers
-			// from Access-Control-Request-Headers can be enough
-			headers["Access-Control-Allow-Headers"] = reqHeaders
-			break
-		}
+	headers["Access-Control-Allow-Methods"] = []string{reqMethod}
+	if len(reqHeaderNames) > 0 {
+		// Spec says: Since the list of headers can be unbounded, simply returning
+		// supported headers from Access-Control-Request-Headers can be enough.
+		// Echo the normalized names that the policy above accepted, so the echo
+		// and the decision always derive from the same normalized strategy.
+		headers["Access-Control-Allow-Headers"] = []string{strings.Join(reqHeaderNames, ", ")}
 	}
 	if c.allowCredentials {
 		headers["Access-Control-Allow-Credentials"] = headerTrue
@@ -482,13 +502,18 @@ func (c *Cors) isOriginAllowed(r *http.Request, origin string) (allowed bool, va
 // isMethodAllowed checks if a given method can be used as part of a cross-domain request
 // on the endpoint
 func (c *Cors) isMethodAllowed(method string) bool {
-	if len(c.allowedMethods) == 0 {
-		// If no method allowed, always return false, even for preflight request
-		return false
-	}
 	if method == http.MethodOptions {
 		// Always allow preflight requests
 		return true
 	}
-	return slices.Contains(c.allowedMethods, method)
+	if c.allowedMethodsAll {
+		return true
+	}
+	if len(c.allowedMethods) == 0 {
+		// If no method allowed, always return false, even for preflight request
+		return false
+	}
+	// Methods are normalized to upper case at construction time; normalize the
+	// incoming method as well so matching is case-insensitive but deterministic.
+	return slices.Contains(c.allowedMethods, strings.ToUpper(method))
 }

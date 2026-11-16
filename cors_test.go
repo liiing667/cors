@@ -556,7 +556,7 @@ func TestSpec(t *testing.T) {
 			true,
 		},
 		{
-			"MultipleACRHHeadersWithOWSAndEmptyElements",
+			"MultipleACRHHeadersNormalizedOnEcho",
 			Options{
 				AllowedOrigins: []string{"http://foobar.com"},
 				AllowedHeaders: []string{"Content-Type", "Authorization"},
@@ -571,7 +571,7 @@ func TestSpec(t *testing.T) {
 				"Vary":                         {"Origin, Access-Control-Request-Method, Access-Control-Request-Headers"},
 				"Access-Control-Allow-Origin":  {"http://foobar.com"},
 				"Access-Control-Allow-Methods": {"GET"},
-				"Access-Control-Allow-Headers": {"authorization\t", " ", " content-type"},
+				"Access-Control-Allow-Headers": {"authorization, content-type"},
 			},
 			true,
 		},
@@ -632,15 +632,15 @@ func TestPreflightRequestHeaderFields(t *testing.T) {
 		present bool
 		denied  bool
 	}{
-		{name: "leading_empty", values: []string{"", "authorization", "content-type"}, want: []string{"", "authorization", "content-type"}, present: true},
-		{name: "leading_empties", values: []string{"", "", "authorization"}, want: []string{"", "", "authorization"}, present: true},
+		{name: "leading_empty", values: []string{"", "authorization", "content-type"}, want: []string{"authorization, content-type"}, present: true},
+		{name: "leading_empties", values: []string{"", "", "authorization"}, want: []string{"authorization"}, present: true},
 		{name: "nonempty", values: []string{"authorization"}, want: []string{"authorization"}, present: true},
 		{name: "empty", values: []string{""}, present: true},
 		{name: "all_empty", values: []string{"", ""}, present: true},
 		{name: "absent"},
 		{name: "nil", present: true},
 		{name: "empty_slice", values: []string{}, present: true},
-		{name: "denied_later", values: []string{"", "x-denied"}, want: []string{"", "x-denied"}, present: true, denied: true},
+		{name: "denied_later", values: []string{"", "x-denied"}, want: []string{"x-denied"}, present: true, denied: true},
 	}
 	for _, wildcard := range []bool{false, true} {
 		name := "explicit"
@@ -680,7 +680,7 @@ func TestPreflightRequestHeaderFields(t *testing.T) {
 	}
 }
 
-func TestPreflightEmptyLeadingHeaderOverHTTP(t *testing.T) {
+func TestPreflightNormalizedHeaderEchoOverHTTP(t *testing.T) {
 	for _, allowedHeaders := range [][]string{{"Authorization"}, {"*"}} {
 		t.Run(allowedHeaders[0], func(t *testing.T) {
 			s := httptest.NewServer(New(Options{AllowedHeaders: allowedHeaders}).Handler(testHandler))
@@ -700,7 +700,7 @@ func TestPreflightEmptyLeadingHeaderOverHTTP(t *testing.T) {
 			if res.StatusCode != http.StatusNoContent {
 				t.Errorf("Status = %d, want %d", res.StatusCode, http.StatusNoContent)
 			}
-			want := []string{"", "authorization"}
+			want := []string{"authorization"}
 			if got := res.Header.Values("Access-Control-Allow-Headers"); !slices.Equal(got, want) {
 				t.Errorf("Access-Control-Allow-Headers = %q, want %q", got, want)
 			}
@@ -913,4 +913,197 @@ func TestAccessControlExposeHeadersPresence(t *testing.T) {
 		})
 	}
 
+}
+
+func newPreflightRequest(method string, acrh ...string) *http.Request {
+	req, _ := http.NewRequest(http.MethodOptions, "http://example.com/foo", nil)
+	req.Header.Set("Origin", "http://foobar.com")
+	req.Header.Set("Access-Control-Request-Method", method)
+	if len(acrh) > 0 {
+		req.Header["Access-Control-Request-Headers"] = acrh
+	}
+	return req
+}
+
+func TestAllowedMethodsNormalization(t *testing.T) {
+	t.Run("case_insensitive_config", func(t *testing.T) {
+		s := New(Options{AllowedMethods: []string{"get", "Post", "delete"}})
+		want := []string{"GET", "POST", "DELETE"}
+		if !slices.Equal(s.allowedMethods, want) {
+			t.Fatalf("allowedMethods = %v, want %v", s.allowedMethods, want)
+		}
+		// A lower-case requested method must be accepted and echoed
+		// in normalized (upper-case) form.
+		res := httptest.NewRecorder()
+		s.Handler(testHandler).ServeHTTP(res, newPreflightRequest("get"))
+		assertResponse(t, res, http.StatusNoContent)
+		if got := res.Header().Values("Access-Control-Allow-Methods"); !slices.Equal(got, []string{"GET"}) {
+			t.Errorf("Access-Control-Allow-Methods = %q, want %q", got, []string{"GET"})
+		}
+	})
+
+	t.Run("duplicates_collapsed", func(t *testing.T) {
+		s := New(Options{AllowedMethods: []string{"GET", "get", "Get", "POST", "post"}})
+		want := []string{"GET", "POST"}
+		if !slices.Equal(s.allowedMethods, want) {
+			t.Fatalf("allowedMethods = %v, want %v", s.allowedMethods, want)
+		}
+		if s.allowedMethodsAll {
+			t.Error("allowedMethodsAll should be false without a wildcard")
+		}
+	})
+
+	t.Run("wildcard_takes_precedence", func(t *testing.T) {
+		s := New(Options{AllowedMethods: []string{"GET", "*", "POST"}})
+		if !s.allowedMethodsAll {
+			t.Fatal("allowedMethodsAll should be true when a wildcard is configured")
+		}
+		if !slices.Equal(s.allowedMethods, []string{"*"}) {
+			t.Fatalf("allowedMethods = %v, want [*]", s.allowedMethods)
+		}
+		for _, method := range []string{"PATCH", "patch", "DELETE"} {
+			if !s.isMethodAllowed(method) {
+				t.Errorf("isMethodAllowed(%q) = false, want true", method)
+			}
+		}
+	})
+
+	t.Run("actual_request_uses_same_normalized_policy", func(t *testing.T) {
+		s := New(Options{
+			AllowedOrigins: []string{"http://foobar.com"},
+			AllowedMethods: []string{"get"},
+		})
+		req, _ := http.NewRequest(http.MethodGet, "http://example.com/foo", nil)
+		req.Header.Set("Origin", "http://foobar.com")
+		res := httptest.NewRecorder()
+		s.Handler(testHandler).ServeHTTP(res, req)
+		if got := res.Header().Get("Access-Control-Allow-Origin"); got != "http://foobar.com" {
+			t.Errorf("Access-Control-Allow-Origin = %q, want http://foobar.com", got)
+		}
+	})
+
+	t.Run("default_set_unchanged", func(t *testing.T) {
+		s := New(Options{})
+		want := []string{http.MethodGet, http.MethodPost, http.MethodHead}
+		if !slices.Equal(s.allowedMethods, want) {
+			t.Errorf("default allowedMethods = %v, want %v", s.allowedMethods, want)
+		}
+		if s.allowedMethodsAll {
+			t.Error("allowedMethodsAll should be false with default methods")
+		}
+	})
+}
+
+func TestAllowedHeadersNormalizationAndEcho(t *testing.T) {
+	t.Run("case_and_duplicates_collapsed", func(t *testing.T) {
+		s := New(Options{AllowedHeaders: []string{"X-Foo", "x-foo", "X-FOO", "x-bar"}})
+		if got := s.allowedHeaders.Size(); got != 2 {
+			t.Fatalf("allowedHeaders.Size() = %d, want 2", got)
+		}
+		if s.allowedHeadersAll {
+			t.Error("allowedHeadersAll should be false without a wildcard")
+		}
+	})
+
+	t.Run("wildcard_takes_precedence", func(t *testing.T) {
+		s := New(Options{AllowedHeaders: []string{"X-Foo", "*", "x-bar"}})
+		if !s.allowedHeadersAll {
+			t.Fatal("allowedHeadersAll should be true when a wildcard is configured")
+		}
+		if got := s.allowedHeaders.Size(); got != 0 {
+			t.Errorf("allowedHeaders.Size() = %d, want 0", got)
+		}
+	})
+
+	t.Run("echo_is_normalized_sorted_and_deduped", func(t *testing.T) {
+		s := New(Options{
+			AllowedOrigins: []string{"http://foobar.com"},
+			AllowedHeaders: []string{"X-Foo", "X-Bar", "X-Baz"},
+		})
+		// Fetch-compliant names (lowercase, sorted, unique) spread over several
+		// field lines; the echo must join them through the normalized strategy.
+		req := newPreflightRequest("GET", "x-bar", "x-baz")
+		res := httptest.NewRecorder()
+		s.Handler(testHandler).ServeHTTP(res, req)
+		assertResponse(t, res, http.StatusNoContent)
+		want := []string{"x-bar, x-baz"}
+		if got := res.Header().Values("Access-Control-Allow-Headers"); !slices.Equal(got, want) {
+			t.Errorf("Access-Control-Allow-Headers = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("ows_and_empty_elements_normalized_when_accepted", func(t *testing.T) {
+		s := New(Options{
+			AllowedOrigins: []string{"http://foobar.com"},
+			AllowedHeaders: []string{"Authorization", "Content-Type"},
+		})
+		req := newPreflightRequest("GET", "", "authorization", "content-type")
+		res := httptest.NewRecorder()
+		s.Handler(testHandler).ServeHTTP(res, req)
+		assertResponse(t, res, http.StatusNoContent)
+		want := []string{"authorization, content-type"}
+		if got := res.Header().Values("Access-Control-Allow-Headers"); !slices.Equal(got, want) {
+			t.Errorf("Access-Control-Allow-Headers = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("denied_header_not_echoed", func(t *testing.T) {
+		s := New(Options{
+			AllowedOrigins: []string{"http://foobar.com"},
+			AllowedHeaders: []string{"X-Foo"},
+		})
+		req := newPreflightRequest("GET", "x-denied")
+		res := httptest.NewRecorder()
+		s.Handler(testHandler).ServeHTTP(res, req)
+		if got := res.Header().Values("Access-Control-Allow-Headers"); got != nil {
+			t.Errorf("Access-Control-Allow-Headers = %q, want absent", got)
+		}
+		if got := res.Header().Values("Access-Control-Allow-Methods"); got != nil {
+			t.Errorf("Access-Control-Allow-Methods = %q, want absent", got)
+		}
+	})
+}
+
+func TestExposedHeadersNormalization(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+		want string
+	}{
+		{
+			name: "case_normalized",
+			in:   []string{"x-foo", "X-BAR"},
+			want: "X-Foo, X-Bar",
+		},
+		{
+			name: "duplicates_collapsed",
+			in:   []string{"X-Foo", "x-foo", "X-FOO", "x-bar"},
+			want: "X-Foo, X-Bar",
+		},
+		{
+			name: "empty_elements_skipped",
+			in:   []string{"", "x-foo", ""},
+			want: "X-Foo",
+		},
+		{
+			name: "wildcard_passthrough",
+			in:   []string{"X-Foo", "*", "x-bar"},
+			want: "*",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(Options{
+				AllowedOrigins: []string{"http://foobar.com"},
+				ExposedHeaders: tc.in,
+			})
+			req, _ := http.NewRequest(http.MethodGet, "http://example.com/foo", nil)
+			req.Header.Set("Origin", "http://foobar.com")
+			res := httptest.NewRecorder()
+			s.Handler(testHandler).ServeHTTP(res, req)
+			if got := res.Header().Get("Access-Control-Expose-Headers"); got != tc.want {
+				t.Errorf("Access-Control-Expose-Headers = %q, want %q", got, tc.want)
+			}
+		})
+	}
 }
