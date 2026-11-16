@@ -44,6 +44,8 @@ type Options struct {
 	// An origin may contain a wildcard (*) to replace 0 or more characters
 	// (i.e.: http://*.domain.com). Usage of wildcards implies a small performance penalty.
 	// Only one wildcard can be used per origin.
+	// Origins are matched case-insensitively and default ports (80 for http,
+	// 443 for https) are ignored, so equivalent origins always match.
 	// Default value is ["*"]
 	AllowedOrigins []string
 	// AllowOriginFunc is a custom function to validate the origin. It take the
@@ -84,6 +86,9 @@ type Options struct {
 	MaxAge int
 	// AllowCredentials indicates whether the request can include user credentials like
 	// cookies, HTTP authentication or client side SSL certificates.
+	// When combined with a "*" AllowedOrigins, the request origin is reflected
+	// in Access-Control-Allow-Origin instead of "*", as browsers reject the
+	// wildcard for credentialed requests.
 	AllowCredentials bool
 	// AllowPrivateNetwork indicates whether to accept cross-origin requests over a
 	// private network.
@@ -172,21 +177,24 @@ func New(options Options) *Cors {
 		c.allowedOrigins = []string{}
 		c.allowedWOrigins = []wildcard{}
 		for _, origin := range options.AllowedOrigins {
-			// Note: for origins matching, the spec requires a case-sensitive matching.
-			// As it may error prone, we chose to ignore the spec here.
-			origin = strings.ToLower(origin)
 			if origin == "*" {
 				// If "*" is present in the list, turn the whole list into a match all
 				c.allowedOriginsAll = true
 				c.allowedOrigins = nil
 				c.allowedWOrigins = nil
 				break
-			} else if prefix, suffix, ok := strings.Cut(origin, "*"); ok {
+			}
+			// Note: for origins matching, the spec requires a case-sensitive matching.
+			// As it may error prone, we chose to ignore the spec here. Equivalent
+			// origins (e.g. differing only in host case or default port) are
+			// normalized so that they share a single authorization conclusion.
+			if strings.Contains(origin, "*") {
 				// Split the origin in two: start and end string without the *
+				prefix, suffix, _ := strings.Cut(normalizeWildcardOrigin(origin), "*")
 				w := wildcard{prefix, suffix}
 				c.allowedWOrigins = append(c.allowedWOrigins, w)
 			} else {
-				c.allowedOrigins = append(c.allowedOrigins, origin)
+				c.allowedOrigins = append(c.allowedOrigins, normalizeOrigin(origin))
 			}
 		}
 	}
@@ -330,18 +338,13 @@ func (c *Cors) handlePreflight(w http.ResponseWriter, r *http.Request) {
 	headers := w.Header()
 	origin := r.Header.Get("Origin")
 
+	allowed, acao, vary := c.authorizeOrigin(r, origin)
+
 	// Always set Vary headers
 	// see https://github.com/rs/cors/issues/10,
 	//     https://github.com/rs/cors/commit/dbdca4d95feaa7511a46e6f1efb3b3aa505bc43f#commitcomment-12352001
-	if vary, found := headers["Vary"]; found {
-		headers["Vary"] = append(vary, c.preflightVary[0])
-	} else {
-		headers["Vary"] = c.preflightVary
-	}
-	allowed, additionalVaryHeaders := c.isOriginAllowed(r, origin)
-	if len(additionalVaryHeaders) > 0 {
-		headers.Add("Vary", strings.Join(convert(additionalVaryHeaders, http.CanonicalHeaderKey), ", "))
-	}
+	addVary(headers, c.preflightVary[0])
+	addVary(headers, vary...)
 
 	if origin == "" {
 		c.logf("  Preflight aborted: empty origin")
@@ -367,11 +370,7 @@ func (c *Cors) handlePreflight(w http.ResponseWriter, r *http.Request) {
 		c.logf("  Preflight aborted: headers '%v' not allowed", reqHeaders)
 		return
 	}
-	if c.allowedOriginsAll {
-		headers["Access-Control-Allow-Origin"] = headerOriginAll
-	} else {
-		headers["Access-Control-Allow-Origin"] = r.Header["Origin"]
-	}
+	headers["Access-Control-Allow-Origin"] = acao
 	// Spec says: Since the list of methods can be unbounded, simply returning the method indicated
 	// by Access-Control-Request-Method (if supported) can be enough
 	headers["Access-Control-Allow-Methods"] = r.Header["Access-Control-Request-Method"]
@@ -400,17 +399,12 @@ func (c *Cors) handleActualRequest(w http.ResponseWriter, r *http.Request) {
 	headers := w.Header()
 	origin := r.Header.Get("Origin")
 
-	allowed, additionalVaryHeaders := c.isOriginAllowed(r, origin)
+	allowed, acao, vary := c.authorizeOrigin(r, origin)
 
 	// Always set Vary, see https://github.com/rs/cors/issues/10
-	if vary := headers["Vary"]; vary == nil {
-		headers["Vary"] = headerVaryOrigin
-	} else {
-		headers["Vary"] = append(vary, headerVaryOrigin[0])
-	}
-	if len(additionalVaryHeaders) > 0 {
-		headers.Add("Vary", strings.Join(convert(additionalVaryHeaders, http.CanonicalHeaderKey), ", "))
-	}
+	addVary(headers, headerVaryOrigin[0])
+	addVary(headers, vary...)
+
 	if origin == "" {
 		c.logf("  Actual request no headers added: missing origin")
 		return
@@ -428,11 +422,7 @@ func (c *Cors) handleActualRequest(w http.ResponseWriter, r *http.Request) {
 		c.logf("  Actual request no headers added: method '%s' not allowed", r.Method)
 		return
 	}
-	if c.allowedOriginsAll {
-		headers["Access-Control-Allow-Origin"] = headerOriginAll
-	} else {
-		headers["Access-Control-Allow-Origin"] = r.Header["Origin"]
-	}
+	headers["Access-Control-Allow-Origin"] = acao
 	if len(c.exposedHeaders) > 0 {
 		headers["Access-Control-Expose-Headers"] = c.exposedHeaders
 	}
@@ -456,27 +446,52 @@ func (c *Cors) logf(format string, a ...any) {
 // WebSocket's CheckOrigin; the middleware itself still lets an
 // origin-less request through.
 func (c *Cors) OriginAllowed(r *http.Request) bool {
-	origin := r.Header.Get("Origin")
-	allowed, _ := c.isOriginAllowed(r, origin)
+	allowed, _, _ := c.authorizeOrigin(r, r.Header.Get("Origin"))
 	return allowed
 }
 
-// isOriginAllowed checks if a given origin is allowed to perform cross-domain requests
-// on the endpoint
-func (c *Cors) isOriginAllowed(r *http.Request, origin string) (allowed bool, varyHeaders []string) {
+// authorizeOrigin is the single source of truth for origin authorization.
+// It reports whether the origin is allowed, the
+// Access-Control-Allow-Origin value to emit when it is, and the extra Vary
+// headers the response depends on. Preflight requests, actual requests and
+// OriginAllowed all share its conclusion, so equivalent origins (e.g.
+// differing only in host case or default port) always yield the same result.
+func (c *Cors) authorizeOrigin(r *http.Request, origin string) (allowed bool, acao []string, varyHeaders []string) {
 	if c.allowOriginFunc != nil {
-		return c.allowOriginFunc(r, origin)
+		allowed, varyHeaders = c.allowOriginFunc(r, origin)
+		if !allowed {
+			return false, nil, varyHeaders
+		}
+		return true, r.Header["Origin"], convert(varyHeaders, http.CanonicalHeaderKey)
 	}
+	if !c.isOriginAllowed(origin) {
+		return false, nil, nil
+	}
+	if c.allowedOriginsAll && !c.allowCredentials {
+		// Without credentials, "*" is a valid wildcard
+		// Access-Control-Allow-Origin value.
+		return true, headerOriginAll, nil
+	}
+	// Reflect the request origin. This is required over "*" when credentials
+	// are allowed, as browsers reject a wildcard Access-Control-Allow-Origin
+	// for credentialed requests. The response then depends on the Origin
+	// header, which caches must be told about via Vary.
+	return true, r.Header["Origin"], headerVaryOrigin
+}
+
+// isOriginAllowed checks if a given origin matches the configured allowed
+// origins, normalizing equivalent origins before matching.
+func (c *Cors) isOriginAllowed(origin string) bool {
 	if c.allowedOriginsAll {
-		return true, nil
+		return true
 	}
-	origin = strings.ToLower(origin)
+	origin = normalizeOrigin(origin)
 	if slices.Contains(c.allowedOrigins, origin) {
-		return true, nil
+		return true
 	}
 	return slices.ContainsFunc(c.allowedWOrigins, func(w wildcard) bool {
 		return w.match(origin)
-	}), nil
+	})
 }
 
 // isMethodAllowed checks if a given method can be used as part of a cross-domain request

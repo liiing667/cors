@@ -128,8 +128,89 @@ func TestSpec(t *testing.T) {
 			},
 			http.Header{
 				"Vary":                             {"Origin"},
-				"Access-Control-Allow-Origin":      {"*"},
+				"Access-Control-Allow-Origin":      {"http://foobar.com"},
 				"Access-Control-Allow-Credentials": {"true"},
+			},
+			true,
+		},
+		{
+			"MatchAllOriginWithCredentialsPreflight",
+			Options{
+				AllowedOrigins:   []string{"*"},
+				AllowCredentials: true,
+			},
+			"OPTIONS",
+			http.Header{
+				"Origin":                        {"http://foobar.com"},
+				"Access-Control-Request-Method": {"GET"},
+			},
+			http.Header{
+				"Vary":                             {"Origin, Access-Control-Request-Method, Access-Control-Request-Headers"},
+				"Access-Control-Allow-Origin":      {"http://foobar.com"},
+				"Access-Control-Allow-Methods":     {"GET"},
+				"Access-Control-Allow-Credentials": {"true"},
+			},
+			true,
+		},
+		{
+			"EquivalentOriginDefaultPort",
+			Options{
+				AllowedOrigins: []string{"http://foobar.com"},
+			},
+			"GET",
+			http.Header{
+				"Origin": {"http://foobar.com:80"},
+			},
+			http.Header{
+				"Vary":                        {"Origin"},
+				"Access-Control-Allow-Origin": {"http://foobar.com:80"},
+			},
+			true,
+		},
+		{
+			"EquivalentOriginDefaultPortInConfig",
+			Options{
+				AllowedOrigins: []string{"https://foobar.com:443"},
+			},
+			"GET",
+			http.Header{
+				"Origin": {"https://foobar.com"},
+			},
+			http.Header{
+				"Vary":                        {"Origin"},
+				"Access-Control-Allow-Origin": {"https://foobar.com"},
+			},
+			true,
+		},
+		{
+			"EquivalentOriginHostCase",
+			Options{
+				AllowedOrigins: []string{"http://foobar.com"},
+			},
+			"OPTIONS",
+			http.Header{
+				"Origin":                        {"http://FOOBAR.com"},
+				"Access-Control-Request-Method": {"GET"},
+			},
+			http.Header{
+				"Vary":                         {"Origin, Access-Control-Request-Method, Access-Control-Request-Headers"},
+				"Access-Control-Allow-Origin":  {"http://FOOBAR.com"},
+				"Access-Control-Allow-Methods": {"GET"},
+			},
+			true,
+		},
+		{
+			"EquivalentOriginWildcardDefaultPort",
+			Options{
+				AllowedOrigins: []string{"http://*.bar.com:80"},
+			},
+			"GET",
+			http.Header{
+				"Origin": {"http://foo.bar.com"},
+			},
+			http.Header{
+				"Vary":                        {"Origin"},
+				"Access-Control-Allow-Origin": {"http://foo.bar.com"},
 			},
 			true,
 		},
@@ -260,6 +341,26 @@ func TestSpec(t *testing.T) {
 				"Vary": {"Origin"},
 			},
 			false,
+		},
+		{
+			"AllowOriginVaryRequestFuncPreflight",
+			Options{
+				AllowOriginVaryRequestFunc: func(r *http.Request, o string) (bool, []string) {
+					return o == "http://foobar.com" && r.Header.Get("Authorization") == "secret", []string{"authorization"}
+				},
+			},
+			"OPTIONS",
+			http.Header{
+				"Origin":                        {"http://foobar.com"},
+				"Authorization":                 {"secret"},
+				"Access-Control-Request-Method": {"GET"},
+			},
+			http.Header{
+				"Vary":                         {"Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Authorization"},
+				"Access-Control-Allow-Origin":  {"http://foobar.com"},
+				"Access-Control-Allow-Methods": {"GET"},
+			},
+			true,
 		},
 		{
 			"MaxAge",
@@ -791,6 +892,112 @@ func TestHandleActualRequestInvalidMethodAbortion(t *testing.T) {
 	assertHeaders(t, res.Header(), http.Header{
 		"Vary": {"Origin"},
 	})
+}
+
+func TestHandlePreflightPreservesExistingVary(t *testing.T) {
+	s := New(Options{
+		AllowOriginVaryRequestFunc: func(r *http.Request, o string) (bool, []string) {
+			return true, []string{"authorization"}
+		},
+	})
+	res := httptest.NewRecorder()
+	res.Header().Set("Vary", "Accept-Encoding")
+	req, _ := http.NewRequest("OPTIONS", "http://example.com/foo", nil)
+	req.Header.Add("Origin", "http://example.com")
+	req.Header.Add("Access-Control-Request-Method", "GET")
+
+	s.handlePreflight(res, req)
+
+	assertHeaders(t, res.Header(), http.Header{
+		"Vary":                         {"Accept-Encoding, Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Authorization"},
+		"Access-Control-Allow-Origin":  {"http://example.com"},
+		"Access-Control-Allow-Methods": {"GET"},
+	})
+}
+
+func TestHandleActualRequestPreservesExistingVary(t *testing.T) {
+	s := New(Options{
+		AllowedOrigins: []string{"http://example.com"},
+	})
+	res := httptest.NewRecorder()
+	res.Header().Add("Vary", "Accept-Encoding")
+	res.Header().Add("Vary", "origin")
+	req, _ := http.NewRequest("GET", "http://example.com/foo", nil)
+	req.Header.Add("Origin", "http://example.com")
+
+	s.handleActualRequest(res, req)
+
+	assertHeaders(t, res.Header(), http.Header{
+		"Vary":                        {"Accept-Encoding, origin"},
+		"Access-Control-Allow-Origin": {"http://example.com"},
+	})
+}
+
+func TestPreflightAndActualRequestAgree(t *testing.T) {
+	cases := []struct {
+		name    string
+		options Options
+		origin  string
+		acao    string
+	}{
+		{
+			name:    "listed_origin",
+			options: Options{AllowedOrigins: []string{"http://foobar.com"}},
+			origin:  "http://foobar.com",
+			acao:    "http://foobar.com",
+		},
+		{
+			name:    "equivalent_origin",
+			options: Options{AllowedOrigins: []string{"http://foobar.com"}},
+			origin:  "http://foobar.com:80",
+			acao:    "http://foobar.com:80",
+		},
+		{
+			name:    "wildcard_credentials",
+			options: Options{AllowedOrigins: []string{"*"}, AllowCredentials: true},
+			origin:  "http://foobar.com",
+			acao:    "http://foobar.com",
+		},
+		{
+			name:    "wildcard_no_credentials",
+			options: Options{AllowedOrigins: []string{"*"}},
+			origin:  "http://foobar.com",
+			acao:    "*",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(tc.options)
+
+			preReq, _ := http.NewRequest("OPTIONS", "http://example.com/foo", nil)
+			preReq.Header.Set("Origin", tc.origin)
+			preReq.Header.Set("Access-Control-Request-Method", "GET")
+			preRes := httptest.NewRecorder()
+			s.handlePreflight(preRes, preReq)
+
+			actReq, _ := http.NewRequest("GET", "http://example.com/foo", nil)
+			actReq.Header.Set("Origin", tc.origin)
+			actRes := httptest.NewRecorder()
+			s.handleActualRequest(actRes, actReq)
+
+			if got, want := preRes.Header().Get("Access-Control-Allow-Origin"), tc.acao; got != want {
+				t.Errorf("preflight Access-Control-Allow-Origin = %q, want %q", got, want)
+			}
+			if got, want := actRes.Header().Get("Access-Control-Allow-Origin"), tc.acao; got != want {
+				t.Errorf("actual Access-Control-Allow-Origin = %q, want %q", got, want)
+			}
+			if got, want := s.OriginAllowed(actReq), true; got != want {
+				t.Errorf("OriginAllowed = %t, want %t", got, want)
+			}
+			if tc.acao != "*" {
+				for name, res := range map[string]*httptest.ResponseRecorder{"preflight": preRes, "actual": actRes} {
+					if !slices.Contains(normalize(res.Header()["Vary"]), "Origin") {
+						t.Errorf("%s Vary = %q, want it to contain Origin", name, res.Header()["Vary"])
+					}
+				}
+			}
+		})
+	}
 }
 
 func TestIsMethodAllowedReturnsFalseWithNoMethods(t *testing.T) {
